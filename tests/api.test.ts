@@ -1,0 +1,293 @@
+// ทดสอบ API กับ server ที่รันอยู่: BASE=http://localhost:3999 npx ts-node tests/api.test.ts
+import assert from "node:assert/strict";
+
+const BASE = process.env.BASE ?? "http://localhost:3000";
+let passed = 0;
+
+async function call(method: string, path: string, body?: unknown, _auth = true) {
+  const res = await fetch(BASE + path, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+  const text = await res.text();
+  let json: any = null;
+  try { json = text ? JSON.parse(text) : null; } catch { /* ไม่ใช่ JSON */ }
+  return { status: res.status, json };
+}
+
+async function t(name: string, fn: () => Promise<void>) {
+  try {
+    await fn();
+    passed++;
+    console.log("  ✔", name);
+  } catch (e: any) {
+    console.log("  ✘", name, "\n     ", e.message.split("\n").slice(0, 4).join("\n      "));
+    process.exitCode = 1;
+  }
+}
+
+async function main() {
+  console.log("Health / ไม่ต้อง login");
+  await t("/health ok", async () => assert.equal((await call("GET", "/health")).json.status, "ok"));
+  await t("ไม่มี token ก็เรียก API ได้ (ไม่มี auth)", async () => assert.equal((await call("GET", "/customers")).status, 200));
+  await t("/auth/login ไม่มีแล้ว -> 404", async () => assert.equal((await call("POST", "/auth/login", {})).status, 404));
+
+  console.log("Settings");
+  await t("GET settings", async () => {
+    const r = await call("GET", "/api/v1/settings");
+    assert.equal(r.status, 200);
+    assert.equal(r.json.data.boxPrice, 65);
+  });
+  await t("PUT settings ผิด (deadline <= depart) -> 400", async () =>
+    assert.equal((await call("PUT", "/settings", { departTime: "13:00", deadlineTime: "12:00" })).status, 400));
+  await t("PUT settings ถูก -> 200", async () => {
+    const r = await call("PUT", "/settings", { serviceTimeMin: 3 });
+    assert.equal(r.status, 200);
+  });
+  const settings = (await call("GET", "/settings")).json.data;
+
+  console.log("Customers");
+  const phone = "08" + String(Date.now()).slice(-8);
+  let cid = 0;
+  await t("POST ลูกค้า -> 201 camelCase + {data}", async () => {
+    const r = await call("POST", "/customers", {
+      firstName: "ทดสอบ", lastName: "ระบบ", phone, latitude: 16.25, longitude: 103.26,
+    });
+    assert.equal(r.status, 201);
+    cid = r.json.data.customerId;
+    assert.ok(cid > 0);
+    assert.equal(r.json.data.firstName, "ทดสอบ");
+    assert.equal(r.json.data.phone, phone);
+  });
+  await t("POST ข้อมูลผิด -> 400 รูปแบบ error ใหม่", async () => {
+    const r = await call("POST", "/customers", { firstName: "", lastName: "x", phone: "123", latitude: 99, longitude: 103 });
+    assert.equal(r.status, 400);
+    assert.equal(r.json.error.code, "VALIDATION");
+    assert.ok(r.json.error.message.includes("firstName") && r.json.error.message.includes("phone"));
+  });
+  await t("POST เบอร์ซ้ำ -> 409 PHONE_EXISTS", async () => {
+    const r = await call("POST", "/customers", { firstName: "a", lastName: "b", phone, latitude: 16.25, longitude: 103.26 });
+    assert.equal(r.status, 409);
+    assert.equal(r.json.error.code, "PHONE_EXISTS");
+  });
+  await t("GET /customers แบ่งหน้า + meta", async () => {
+    const r = await call("GET", "/customers?page=1&limit=5&sort=name");
+    assert.equal(r.status, 200);
+    assert.ok(r.json.data.length <= 5);
+    assert.ok(r.json.meta.total >= 1);
+    assert.equal(r.json.meta.limit, 5);
+    assert.equal((await call("GET", "/customers?sort=bad")).status, 400);
+  });
+  await t("ค้น q=ทดสอบ (ชื่อหรือนามสกุล)", async () => {
+    const r = await call("GET", "/customers?q=" + encodeURIComponent("ทดสอบ"));
+    assert.ok(r.json.data.length >= 1);
+    const r2 = await call("GET", "/customers?q=" + encodeURIComponent("ระบบ"));
+    assert.ok(r2.json.data.some((c: any) => c.customerId === cid), "ค้นจากนามสกุลได้");
+  });
+  await t("q เป็น SQL injection / wildcard -> ไม่พบ ไม่ error", async () => {
+    const r = await call("GET", "/customers?q=" + encodeURIComponent("' OR 1=1 --"));
+    // บน Render, Cloudflare อาจบล็อกสตริงนี้ (403) ก่อนถึง server ซึ่งถือว่าปลอดภัยเช่นกัน
+    assert.ok(r.status === 403 || r.status === 200, "status " + r.status);
+    if (r.status === 200) assert.equal(r.json.data.length, 0);
+    const w = await call("GET", "/customers?q=" + encodeURIComponent("%"));
+    assert.equal(w.json.data.length, 0, "% ต้องถูกมองเป็นตัวอักษร ไม่ใช่ wildcard");
+  });
+  await t("nearby 1 กม. เรียงใกล้->ไกล มี distanceM", async () => {
+    const r = await call("GET", `/customers/nearby?lat=${settings.depotLat}&lng=${settings.depotLng}&radiusKm=1`);
+    assert.equal(r.status, 200);
+    const d = r.json.data.map((c: any) => c.distanceM);
+    assert.ok(d.every((x: number) => x <= 1000));
+    assert.deepEqual(d, [...d].sort((a: number, b: number) => a - b));
+  });
+  await t("nearby ไม่ส่ง lat -> 400", async () => assert.equal((await call("GET", "/customers/nearby")).json.error.code, "VALIDATION"));
+  await t("PUT ลูกค้า -> 200 + ค่าใหม่", async () => {
+    const r = await call("PUT", `/customers/${cid}`, { firstName: "ทดสอบ2", lastName: "ระบบ", phone, latitude: 16.25, longitude: 103.26 });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.data.firstName, "ทดสอบ2");
+  });
+  await t("PUT/GET ลูกค้า id ไม่มี -> 404 NOT_FOUND", async () => {
+    const g = await call("GET", "/customers/99999999");
+    assert.equal(g.status, 404);
+    assert.equal(g.json.error.code, "NOT_FOUND");
+    assert.equal((await call("PUT", "/customers/99999999", { firstName: "a", lastName: "b", phone: "0812345670", latitude: 1, longitude: 1 })).status, 404);
+  });
+
+  console.log("Orders");
+  const DATE = "2031-01-15"; // วันทดสอบ (ไม่ชนข้อมูลจริง)
+  await call("DELETE", `/orders/simulated?date=${DATE}`);
+  let oid = 0;
+  await t("POST order กล่อง 0 -> 400", async () =>
+    assert.equal((await call("POST", "/orders", { customerId: cid, boxCount: 0, deliveryDate: DATE })).status, 400));
+  await t("POST order กล่อง 4 -> 400", async () =>
+    assert.equal((await call("POST", "/orders", { customerId: cid, boxCount: 4, deliveryDate: DATE })).status, 400));
+  await t("POST order ลูกค้าไม่มี -> 404", async () =>
+    assert.equal((await call("POST", "/orders", { customerId: 99999999, boxCount: 1, deliveryDate: DATE })).status, 404));
+  await t("POST order -> 201 + snapshot", async () => {
+    const r = await call("POST", "/orders", { customerId: cid, boxCount: 2, deliveryDate: DATE });
+    assert.equal(r.status, 201);
+    oid = r.json.data.order_id;
+    assert.equal(r.json.data.unit_price, 65);
+    assert.match(r.json.data.order_no, /^310115-\d{3}$/);
+  });
+  await t("PATCH order กล่อง -> 200", async () => {
+    const r = await call("PATCH", `/orders/${oid}`, { boxCount: 3 });
+    assert.equal(r.json.data.box_count, 3);
+  });
+  await t("simulate 19 / 31 -> 400", async () => {
+    assert.equal((await call("POST", "/orders/simulate", { count: 19, deliveryDate: DATE })).status, 400);
+    assert.equal((await call("POST", "/orders/simulate", { count: 31, deliveryDate: DATE })).status, 400);
+  });
+  await t("simulate 25 -> 201", async () => {
+    const r = await call("POST", "/orders/simulate", { count: 25, mode: "append", deliveryDate: DATE });
+    assert.equal(r.status, 201, JSON.stringify(r.json));
+    assert.equal(r.json.summary.count, 25);
+    assert.ok(r.json.data.every((o: any) => o.box_count >= 1 && o.box_count <= 3));
+  });
+  await t("GET orders มี summary + ไม่ล็อก", async () => {
+    const r = await call("GET", `/orders?date=${DATE}`);
+    assert.equal(r.json.meta.total, 26);
+    assert.equal(r.json.meta.locked, false);
+  });
+  await t("orders/nearby 2 กม. เฉพาะวันที่ระบุ", async () => {
+    const r = await call("GET", `/orders/nearby?lat=${settings.depotLat}&lng=${settings.depotLng}&radiusKm=2&date=${DATE}`);
+    assert.equal(r.status, 200);
+    assert.ok(r.json.data.every((o: any) => o.distance_m <= 2000 && String(o.delivery_date) === DATE));
+    const other = await call("GET", `/orders/nearby?lat=${settings.depotLat}&lng=${settings.depotLng}&radiusKm=2&date=2031-01-16`);
+    assert.equal(other.json.data.length, 0);
+  });
+
+  console.log("Dispatch");
+  let plans: any[] = [];
+  await t("คำนวณแผน -> 201 มี 3 แผน", async () => {
+    const t0 = Date.now();
+    const r = await call("POST", "/dispatch-plans", { deliveryDate: DATE });
+    assert.equal(r.status, 201, JSON.stringify(r.json));
+    plans = r.json.data;
+    assert.equal(plans.length, 3);
+    assert.ok(Date.now() - t0 < 10000, "ช้าเกิน 10 วินาที");
+    for (const p of plans) {
+      assert.equal(p.orderCount, 26);
+      assert.ok(p.isOnTime);
+      assert.ok(Math.abs(p.profit - (p.revenue - p.foodCost - p.deliveryCost)) < 0.01);
+    }
+    const cost = plans.find((p) => p.objective === "MIN_COST");
+    assert.ok(plans.every((p) => cost.deliveryCost <= p.deliveryCost + 0.01), "MIN_COST ต้องค่าไรเดอร์ต่ำสุด");
+  });
+  await t("รายละเอียดแผน: ทุกออเดอร์พอดี 1 ครั้ง, ≤3 จุด/รอบ, ผลรวมตรง", async () => {
+    const r = await call("GET", `/dispatch-plans/${plans[0].planId}`);
+    const d = r.json.data;
+    const ids = d.routes.flatMap((x: any) => x.stops.map((s: any) => s.orderId));
+    assert.equal(new Set(ids).size, 26);
+    assert.equal(ids.length, 26);
+    assert.ok(d.routes.every((x: any) => x.stops.length <= 3 && x.finishTime <= "12:30:00"));
+    const fee = d.routes.reduce((s: number, x: any) => s + x.riderFee, 0);
+    assert.ok(Math.abs(fee - d.deliveryCost) < 0.01);
+    assert.equal(d.routes.reduce((s: number, x: any) => s + x.totalBoxes, 0), d.totalBoxes);
+  });
+  await t("คำนวณใหม่ (recalculate) -> 201 variant 2", async () => {
+    const r = await call("POST", "/dispatch-plans", { deliveryDate: DATE, recalculate: true });
+    assert.equal(r.status, 201);
+    assert.equal(r.json.data[0].variantNo, 2);
+    plans = r.json.data;
+  });
+  await t("แก้ออเดอร์ขณะมีแผนร่าง -> แผนร่างหาย", async () => {
+    await call("PATCH", `/orders/${oid}`, { boxCount: 1 });
+    const r = await call("GET", `/dispatch-plans?date=${DATE}&status=DRAFT`);
+    assert.equal(r.json.data.length, 0);
+    const c = await call("POST", "/dispatch-plans", { deliveryDate: DATE });
+    plans = c.json.data;
+    assert.equal(c.status, 201);
+  });
+  let planId = 0;
+  let codes: string[] = [];
+  await t("ยืนยันแผน -> ได้เลขใบงานทุก route", async () => {
+    planId = plans.find((p) => p.objective === "MIN_COST").planId;
+    const r = await call("POST", `/dispatch-plans/${planId}/confirm`);
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    codes = r.json.data.routes.map((x: any) => x.jobCode);
+    assert.ok(codes.every((c) => /^[A-HJ-NP-Z2-9]{6}$/.test(c)));
+    assert.equal(new Set(codes).size, codes.length);
+    assert.equal(r.json.data.status, "CONFIRMED");
+  });
+  await t("ยืนยันซ้ำ -> 409", async () =>
+    assert.equal((await call("POST", `/dispatch-plans/${planId}/confirm`)).status, 409));
+  await t("หลังยืนยัน แก้/ลบ/simulate/ล้าง/คำนวณ -> 409", async () => {
+    assert.equal((await call("PATCH", `/orders/${oid}`, { boxCount: 2 })).json.error.code, "ORDER_LOCKED");
+    assert.equal((await call("DELETE", `/orders/${oid}`)).status, 409);
+    assert.equal((await call("POST", "/orders/simulate", { count: 20, deliveryDate: DATE })).status, 409);
+    assert.equal((await call("DELETE", `/orders/simulated?date=${DATE}`)).status, 409);
+    assert.equal((await call("POST", "/dispatch-plans", { deliveryDate: DATE })).status, 409);
+  });
+  await t("ตั้งชื่อไรเดอร์", async () => {
+    const d = (await call("GET", `/dispatch-plans/${planId}`)).json.data;
+    const r = await call("PATCH", `/dispatch-plans/${planId}/routes/${d.routes[0].routeId}`, {
+      riderName: "สมศักดิ์", riderPhone: "0812345678",
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.data.routes[0].riderName, "สมศักดิ์");
+  });
+  await t("dashboard", async () => {
+    const r = await call("GET", `/dashboard/summary?date=${DATE}`);
+    assert.equal(r.json.data.planStatus, "CONFIRMED");
+    assert.equal(r.json.data.orders, 26);
+  });
+
+  console.log("Jobs (public)");
+  await t("ใบงานถูกต้อง -> 200 เฉพาะจุดของ route", async () => {
+    // วันทดสอบอยู่อนาคต จึงไม่หมดอายุ
+    const r = await call("GET", `/public/jobs/${codes[0]}`, undefined, false);
+    assert.equal(r.status, 200);
+    assert.ok(r.json.stops.length >= 1 && r.json.stops.length <= 3);
+    assert.equal(r.json.stops.reduce((s: number, x: any) => s + x.boxCount, 0), r.json.totalBoxes);
+    assert.equal(r.json.departTime, "11:30");
+  });
+  await t("ใบงานตัวพิมพ์เล็กก็เปิดได้", async () =>
+    assert.equal((await call("GET", `/public/jobs/${codes[0]!.toLowerCase()}`, undefined, false)).status, 200));
+  await t("เลขไม่มี -> 404", async () =>
+    assert.equal((await call("GET", "/public/jobs/ZZZZZZ", undefined, false)).status, 404));
+
+  await t("ยกเลิกแผน -> ใบงานใช้ไม่ได้ + ปลดล็อก", async () => {
+    const r = await call("POST", `/dispatch-plans/${planId}/cancel`);
+    assert.equal(r.status, 200);
+    assert.equal((await call("GET", `/public/jobs/${codes[0]}`, undefined, false)).status, 404);
+    assert.equal((await call("PATCH", `/orders/${oid}`, { boxCount: 2 })).status, 200);
+    assert.equal((await call("POST", `/dispatch-plans/${planId}/cancel`)).status, 409);
+  });
+  await t("ยืนยันแผนใหม่หลังยกเลิกได้ (ไม่ชน UNIQUE)", async () => {
+    const c = await call("POST", "/dispatch-plans", { deliveryDate: DATE });
+    const r = await call("POST", `/dispatch-plans/${c.json.data[0].planId}/confirm`);
+    assert.equal(r.status, 200);
+    await call("POST", `/dispatch-plans/${c.json.data[0].planId}/cancel`);
+  });
+
+  console.log("Cleanup");
+  await t("ล้างออเดอร์จำลอง + ลบออเดอร์/ลูกค้าทดสอบ", async () => {
+    const r = await call("DELETE", `/orders/simulated?date=${DATE}`);
+    assert.equal(r.status, 200);
+    assert.equal(r.json.deletedCount, 25);
+  });
+  await t("ลบ order กับ ลูกค้าที่มีออเดอร์ได้/ไม่ได้ตามกฎ", async () => {
+    assert.equal((await call("DELETE", `/customers/${cid}`)).json.error.code, "CUSTOMER_HAS_ORDERS"); // ยังมีออเดอร์
+    assert.equal((await call("DELETE", `/orders/${oid}`)).status, 204);
+    assert.equal((await call("DELETE", `/customers/${cid}`)).status, 204);
+  });
+  await t("ออเดอร์ไกลเกินส่งทัน -> 422 INFEASIBLE", async () => {
+    const far = await call("POST", "/customers", {
+      firstName: "ไกล", lastName: "มาก", phone: "07" + String(Date.now()).slice(-8), latitude: 17.5, longitude: 104.5,
+    });
+    const fid = far.json.data.customerId;
+    const o = await call("POST", "/orders", { customerId: fid, boxCount: 1, deliveryDate: "2031-01-16" });
+    const r = await call("POST", "/dispatch-plans", { deliveryDate: "2031-01-16" });
+    assert.equal(r.status, 422);
+    assert.equal(r.json.error.code, "INFEASIBLE");
+    await call("DELETE", `/orders/${o.json.data.order_id}`);
+    await call("DELETE", `/customers/${fid}`);
+  });
+
+  console.log(`\nผ่าน ${passed} รายการ${process.exitCode ? " (มีที่ไม่ผ่าน)" : " ทั้งหมด"}`);
+}
+
+main();
